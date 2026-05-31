@@ -4,78 +4,91 @@ namespace Frescoref\Woplucore;
 
 use Frescoref\Woplucore\Contracts\Hooksable;
 use Frescoref\Woplucore\Contracts\Noncesable;
-use Frescoref\Woplucore\Contracts\Viewable;
 use Frescoref\Woplucore\Contracts\Noticesable;
+use Frescoref\Woplucore\Contracts\Viewable;
+use InvalidArgumentException;
 
 /**
  * Class NoticesManager
  *
- * @package Woplucore\Notices
+ * @package Frescoref\Woplucore
  * @since 1.0.0
  */
 class NoticesManager implements Noticesable
 {
     /**
+     * Views manager for template rendering.
+     *
      * @var Viewable
      */
     private $views;
 
     /**
+     * Nonce provider for secure dismissal verification.
+     *
      * @var Noncesable
      */
     private $nonces;
 
     /**
-     * @var Hooksable|null
-     */
-    private $hooks;
-
-    /**
+     * Safe prefix for keys, actions, and query parameters.
+     *
      * @var string
      */
     private $safePrefix;
 
     /**
+     * Target user ID. Defaults to current logged-in user.
+     *
      * @var int
      */
     private $userId;
 
     /**
-     * @var bool
-     */
-    private $isNetworkContext;
-
-    /**
+     * Default template path for notices without type-specific override.
+     *
      * @var string
      */
     private $defaultTemplate = 'notices/list';
 
     /**
+     * Default TTL (seconds) for flash transients.
+     *
      * @var int
      */
     private $defaultTtl = 60;
 
     /**
+     * Current execution context.
+     *
      * @var string|null
      */
-    private $currentContext;
+    private $currentContext = null;
 
     /**
-     * @var array<string, array{id: string, message: string, type: string, args: array, config: array, actions: array, dismiss_data: array, priority: int, context: string}>
+     * Registered persistent notices, keyed by storage key (prefix_id_context).
+     *
+     * @var array<string, array>
      */
     private $persistent = [];
 
     /**
-     * @var array<string, array{id: string, message: string, type: string, args: array, config: array, actions: array, dismiss_data: array, priority: int, context: string}>
+     * Current flash queue (also persisted to transient).
+     *
+     * @var array<int, array>
      */
     private $flashQueue = [];
 
     /**
-     * @var array<callable>
+     * Pre-render interceptors chain.
+     *
+     * @var array<int, callable>
      */
     private $interceptors = [];
 
     /**
+     * Registered notice types with default visual and ARIA configuration.
+     *
      * @var array<string, array{class: string, icon: string, color: string, dismissible: bool, template: string|null, aria_role: string}>
      */
     private $types = [
@@ -86,18 +99,19 @@ class NoticesManager implements Noticesable
     ];
 
     /**
-     * @param Viewable     $views  Views manager.
-     * @param Noncesable   $nonces Nonce provider.
-     * @param string       $prefix Isolation prefix.
-     * @param int          $userId Target user ID.
+     * Constructor.
+     *
+     * @param Viewable   $views  Views manager.
+     * @param Noncesable $nonces Nonce provider.
+     * @param string     $prefix Isolation prefix.
+     * @param int        $userId Target user ID (0 for current).
      */
     public function __construct(Viewable $views, Noncesable $nonces, string $prefix = '', int $userId = 0)
     {
-        $this->views            = $views;
-        $this->nonces           = $nonces;
-        $this->safePrefix       = '' !== $prefix ? \trim($prefix, '-_') : 'notices';
-        $this->userId           = $userId > 0 ? $userId : (\function_exists('get_current_user_id') ? \get_current_user_id() : 0);
-        $this->isNetworkContext = \function_exists('is_multisite') && \is_multisite() && \function_exists('is_network_admin') && \is_network_admin();
+        $this->views      = $views;
+        $this->nonces     = $nonces;
+        $this->safePrefix = '' !== $prefix ? \trim($prefix, '-_') : 'notices';
+        $this->userId     = $userId > 0 ? $userId : (\function_exists('get_current_user_id') ? \get_current_user_id() : 0);
     }
 
     // =========================================================================
@@ -148,52 +162,83 @@ class NoticesManager implements Noticesable
     }
 
     // =========================================================================
-    // QUEUING & DEDUPLICATION
+    // QUEUING
     // =========================================================================
 
     /** {@inheritDoc} */
-    public function add(string $message, string $type = 'info', array $args = [], ?string $context = null, int $priority = 10, ?string $requiredCap = null, ?int $expiresAt = null, array $actions = []): self
-    {
+    public function add(
+        string $message,
+        string $type = 'info',
+        array $args = [],
+        ?string $context = null,
+        int $priority = 10,
+        ?string $requiredCap = null,
+        ?int $expiresAt = null,
+        array $actions = []
+    ): self {
         $ctx = $context ?? $this->currentContext ?? 'global';
-        $notice = $this->buildNotice($message, $type, $args, $ctx, $priority, $requiredCap, $expiresAt, $actions);
-        $this->flashQueue[] = $notice;
+        $this->flashQueue[] = $this->buildNotice(
+            $message, $type, $args, $ctx, $priority, $requiredCap, $expiresAt, $actions, ''
+        );
         $this->saveFlashQueue();
         return $this;
     }
 
     /** {@inheritDoc} */
-    public function persistent(string $id, string $message, string $type = 'info', array $args = [], ?string $context = null, int $priority = 10, ?string $requiredCap = null, ?int $expiresAt = null, array $actions = []): self
-    {
+    public function persistent(
+        string $id,
+        string $message,
+        string $type = 'info',
+        array $args = [],
+        ?string $context = null,
+        int $priority = 10,
+        ?string $requiredCap = null,
+        ?int $expiresAt = null,
+        array $actions = []
+    ): self {
         $ctx = $context ?? $this->currentContext ?? 'global';
-        $noticeId = $this->safePrefix . '_' . $id . '_' . $ctx;
+        $storageKey = $this->buildStorageKey($id, $ctx);
 
-        // Deduplication: skip if identical message already registered
-        if (isset($this->persistent[$noticeId]) && $this->persistent[$noticeId]['message'] === $message) {
+        // Deduplication: skip if identical message already registered in current request
+        if (isset($this->persistent[$storageKey]) && $this->persistent[$storageKey]['message'] === $message) {
             return $this;
         }
 
-        // Deduplication: skip if already dismissed and not expired
-        if ($this->isDismissed($id) && (null === $expiresAt || $expiresAt > \time())) {
+        // Check dismissal state (with context)
+        $isDismissed = $this->isDismissed($id, $ctx);
+        $isExpired   = null !== $expiresAt && $expiresAt <= \time();
+
+        // Auto-restore if previously dismissed AND now expired
+        if ($isDismissed && $isExpired) {
+            $this->restore($id, $ctx);
+            $isDismissed = false;
+        }
+
+        // Skip if still dismissed and not expired
+        if ($isDismissed && !$isExpired) {
             return $this;
         }
 
-        $this->persistent[$noticeId] = $this->buildNotice($message, $type, $args, $ctx, $priority, $requiredCap, $expiresAt, $actions);
+        $this->persistent[$storageKey] = $this->buildNotice(
+            $message, $type, $args, $ctx, $priority, $requiredCap, $expiresAt, $actions, $id
+        );
         return $this;
     }
 
     // =========================================================================
-    // DISMISSAL
+    // DISMISSAL (context-aware)
     // =========================================================================
 
     /** {@inheritDoc} */
-    public function dismiss(string $id): bool
+    public function dismiss(string $id, ?string $context = null): bool
     {
         if (0 === $this->userId) {
             return false;
         }
 
+        $ctx = $context ?? $this->currentContext ?? 'global';
         $dismissed = $this->getDismissedMeta();
-        $metaId    = $this->safePrefix . '_' . $id;
+        $metaId = $this->buildMetaId($id, $ctx);
 
         if (\in_array($metaId, $dismissed, true)) {
             return true;
@@ -204,15 +249,16 @@ class NoticesManager implements Noticesable
     }
 
     /** {@inheritDoc} */
-    public function restore(string $id): bool
+    public function restore(string $id, ?string $context = null): bool
     {
         if (0 === $this->userId) {
             return false;
         }
 
-        $metaId    = $this->safePrefix . '_' . $id;
+        $ctx = $context ?? $this->currentContext ?? 'global';
+        $metaId = $this->buildMetaId($id, $ctx);
         $dismissed = $this->getDismissedMeta();
-        $key       = \array_search($metaId, $dismissed, true);
+        $key = \array_search($metaId, $dismissed, true);
 
         if (false === $key) {
             return false;
@@ -223,13 +269,14 @@ class NoticesManager implements Noticesable
     }
 
     /** {@inheritDoc} */
-    public function isDismissed(string $id): bool
+    public function isDismissed(string $id, ?string $context = null): bool
     {
         if (0 === $this->userId) {
             return false;
         }
 
-        return \in_array($this->safePrefix . '_' . $id, $this->getDismissedMeta(), true);
+        $ctx = $context ?? $this->currentContext ?? 'global';
+        return \in_array($this->buildMetaId($id, $ctx), $this->getDismissedMeta(), true);
     }
 
     // =========================================================================
@@ -250,28 +297,29 @@ class NoticesManager implements Noticesable
             }
         }
 
-        // Apply interceptors first
+        // Apply interceptors first (user-defined transformations)
         foreach ($this->interceptors as $cb) {
             $notices = \call_user_func($cb, $notices);
         }
 
         // Filter expired
         $now = \time();
-        $notices = \array_filter($notices, function (array $n) use ($now): bool {
+        $notices = \array_filter($notices, static function (array $n) use ($now): bool {
             return empty($n['args']['expires_at']) || $n['args']['expires_at'] > $now;
         });
 
         // Filter by capability
-        $notices = \array_filter($notices, function (array $n): bool {
+        $notices = \array_filter($notices, static function (array $n): bool {
             if (empty($n['args']['required_cap'])) {
                 return true;
             }
             return \function_exists('current_user_can') && \current_user_can($n['args']['required_cap']);
         });
 
-        // Filter dismissed
-        $notices = \array_filter($notices, function (array $n): bool {
-            return !$this->isDismissed(\preg_replace('/^' . \preg_quote($this->safePrefix) . '_|_.*$/', '', $n['id']));
+        // Filter dismissed - use base_id directly (no regex)
+        $manager = $this;
+        $notices = \array_filter($notices, static function (array $n) use ($manager): bool {
+            return !$manager->isDismissed($n['base_id'], $n['context']);
         });
 
         // Sort by priority (lower = higher)
@@ -279,7 +327,7 @@ class NoticesManager implements Noticesable
             return $a['priority'] <=> $b['priority'];
         });
 
-        return $notices;
+        return \array_values($notices);
     }
 
     /** {@inheritDoc} */
@@ -324,34 +372,43 @@ class NoticesManager implements Noticesable
     /** {@inheritDoc} */
     public function bind(Hooksable $hooks, string $renderHook = 'admin_notices', string $dismissHookTag = 'wp_ajax'): void
     {
-        $this->hooks = $hooks;
         $manager = $this;
         $ctx = $this->currentContext;
         $param = $this->dismissUrlParam();
+        $ajaxAction = $this->dismissAjaxTag();
 
         // Render hook
         $hooks->addAction($renderHook, static function () use ($manager, $ctx): void {
             $manager->render($ctx);
         }, 10);
 
-        // AJAX dismissal hook
-        $action = $this->dismissAjaxTag();
-        $hooks->addAction("{$dismissHookTag}_{$action}", static function () use ($manager): void {
+        // AJAX dismissal hook (logged in)
+        $hooks->addAction("{$dismissHookTag}_{$ajaxAction}", static function () use ($manager): void {
             $request = [];
+            // Safe extraction isolated from business logic
             if (isset($_POST['notice_id'])) { $request['notice_id'] = \sanitize_key((string) $_POST['notice_id']); }
             if (isset($_POST['nonce'])) { $request['nonce'] = \sanitize_text_field((string) $_POST['nonce']); }
+            if (isset($_POST['context'])) { $request['context'] = \sanitize_key((string) $_POST['context']); }
 
             echo \wp_json_encode($manager->handleAjaxDismissal($request));
-            exit;
+
+            if (\function_exists('wp_die')) {
+                \wp_die();
+            }
         }, 5);
 
-        $hooks->addAction("{$dismissHookTag}_nopriv_{$action}", static function () use ($manager): void {
+        // AJAX dismissal hook (nopriv fallback)
+        $hooks->addAction("{$dismissHookTag}_nopriv_{$ajaxAction}", static function () use ($manager): void {
             $request = [];
             if (isset($_POST['notice_id'])) { $request['notice_id'] = \sanitize_key((string) $_POST['notice_id']); }
             if (isset($_POST['nonce'])) { $request['nonce'] = \sanitize_text_field((string) $_POST['nonce']); }
+            if (isset($_POST['context'])) { $request['context'] = \sanitize_key((string) $_POST['context']); }
 
             echo \wp_json_encode($manager->handleAjaxDismissal($request));
-            exit;
+
+            if (\function_exists('wp_die')) {
+                \wp_die();
+            }
         }, 5);
 
         // URL fallback hook (legacy/non-JS)
@@ -359,17 +416,20 @@ class NoticesManager implements Noticesable
             $request = [];
             if (isset($_GET[$param])) { $request['notice_id'] = \sanitize_key((string) $_GET[$param]); }
             if (isset($_GET['_wpnonce'])) { $request['nonce'] = \sanitize_text_field((string) $_GET['_wpnonce']); }
+            if (isset($_GET['context'])) { $request['context'] = \sanitize_key((string) $_GET['context']); }
 
             $redirect = $manager->handleUrlDismissal($request);
             if (null !== $redirect) {
                 \wp_safe_redirect($redirect);
-                exit;
+                if (\function_exists('wp_die')) {
+                    \wp_die();
+                }
             }
         }, 5);
     }
 
     // =========================================================================
-    // DISMISSAL HANDLERS
+    // HANDLERS
     // =========================================================================
 
     /** {@inheritDoc} */
@@ -380,10 +440,12 @@ class NoticesManager implements Noticesable
         }
 
         if (!$this->nonces->verify($request['nonce'], $this->nonceAction($request['notice_id']))) {
-            throw new \InvalidArgumentException('Invalid dismissal nonce.');
+            throw new InvalidArgumentException('Invalid dismissal nonce.');
         }
 
-        $this->dismiss($request['notice_id']);
+        $ctx = $request['context'] ?? null;
+        $this->dismiss($request['notice_id'], $ctx);
+
         $referer = isset($_SERVER['HTTP_REFERER']) ? \esc_url_raw((string) $_SERVER['HTTP_REFERER']) : '';
         return '' !== $referer ? $referer : (\function_exists('admin_url') ? \admin_url() : '/');
     }
@@ -399,7 +461,8 @@ class NoticesManager implements Noticesable
             return ['success' => false, 'message' => 'Nonce verification failed.'];
         }
 
-        $this->dismiss($request['notice_id']);
+        $ctx = $request['context'] ?? null;
+        $this->dismiss($request['notice_id'], $ctx);
         return ['success' => true];
     }
 
@@ -452,18 +515,45 @@ class NoticesManager implements Noticesable
     // INTERNAL HELPERS
     // =========================================================================
 
-    private function buildNotice(string $message, string $type, array $args, string $context, int $priority, ?string $requiredCap, ?int $expiresAt, array $actions): array
-    {
+    /**
+     * Build normalized notice array.
+     *
+     * @param string      $message     Notice message.
+     * @param string      $type        Notice type.
+     * @param array       $args        Overrides.
+     * @param string      $context     Context.
+     * @param int         $priority    Priority.
+     * @param string|null $requiredCap Required capability.
+     * @param int|null    $expiresAt   Expiration timestamp.
+     * @param array       $actions     Action buttons.
+     * @param string      $baseId      Base ID (empty for flash).
+     * @return array
+     */
+    private function buildNotice(
+        string $message,
+        string $type,
+        array $args,
+        string $context,
+        int $priority,
+        ?string $requiredCap,
+        ?int $expiresAt,
+        array $actions,
+        string $baseId
+    ): array {
         $typeConfig = $this->resolveType($type);
-        $noticeId = \bin2hex(\random_bytes(6));
-        $prefixedId = $this->safePrefix . '_' . $noticeId;
 
-        $processedActions = $this->resolveActions($prefixedId, $actions);
+        // Use provided base_id for persistent, generate random for flash
+        $id = '' !== $baseId ? $baseId : \bin2hex(\random_bytes(6));
+        $prefixedId = $this->safePrefix . '_' . $id;
+
+        $processedActions = $this->resolveActions($actions);
+
         $dismissData = [
-            'url'      => $this->buildDismissUrl($prefixedId),
+            'url'      => $this->buildDismissUrl($prefixedId, $context),
             'ajax_url' => \function_exists('admin_url') ? \admin_url('admin-ajax.php') : '',
             'action'   => $this->dismissAjaxTag(),
             'nonce'    => $this->nonces->create($this->nonceAction($prefixedId)),
+            'context'  => $context,
         ];
 
         $finalArgs = \array_merge([
@@ -474,43 +564,56 @@ class NoticesManager implements Noticesable
         ], $args);
 
         return [
-            'id'          => $prefixedId,
-            'message'     => $message,
-            'type'        => $type,
-            'args'        => $finalArgs,
-            'config'      => \array_merge($typeConfig, ['class' => \trim("{$typeConfig['class']} " . ($finalArgs['class'] ?? ''))]),
-            'actions'     => $processedActions,
-            'dismiss_data'=> $dismissData,
-            'priority'    => $priority,
-            'context'     => $context,
+            'id'           => $prefixedId,
+            'base_id'      => $id,
+            'message'      => $message,
+            'type'         => $type,
+            'args'         => $finalArgs,
+            'config'       => \array_merge($typeConfig, ['class' => \trim("{$typeConfig['class']} " . ($finalArgs['class'] ?? ''))]),
+            'actions'      => $processedActions,
+            'dismiss_data' => $dismissData,
+            'priority'     => $priority,
+            'context'      => $context,
         ];
     }
 
-    private function resolveActions(string $noticeId, array $actions): array
+    /**
+     * Resolve actions. Actions are INDEPENDENT of dismiss - no auto-injection.
+     *
+     * @param array $actions Actions array.
+     * @return array
+     */
+    private function resolveActions(array $actions): array
     {
-        return \array_map(function (array $act) use ($noticeId): array {
-            $url = $act['url'] ?? '';
-            if ('' !== $url && \function_exists('add_query_arg')) {
-                $url = \add_query_arg([
-                    $this->dismissUrlParam() => $noticeId,
-                    '_wpnonce'               => $this->nonces->create($this->nonceAction($noticeId)),
-                ], $url);
-            }
+        return \array_map(static function (array $act): array {
             return [
                 'label'   => $act['label'] ?? '',
-                'url'     => \esc_url($url),
+                'url'     => \esc_url($act['url'] ?? ''),
                 'action'  => $act['action'] ?? '',
                 'primary' => !empty($act['primary']),
             ];
         }, $actions);
     }
 
+    /**
+     * Resolve type configuration.
+     *
+     * @param string $type Type identifier.
+     * @return array
+     */
     private function resolveType(string $type): array
     {
         return $this->types[$type] ?? $this->types['info'];
     }
 
-    private function buildDismissUrl(string $id): string
+    /**
+     * Build dismiss URL.
+     *
+     * @param string $id      Prefixed notice ID.
+     * @param string $context Context.
+     * @return string
+     */
+    private function buildDismissUrl(string $id, string $context): string
     {
         if (!\function_exists('add_query_arg')) {
             return '';
@@ -518,38 +621,70 @@ class NoticesManager implements Noticesable
         return \esc_url(\add_query_arg([
             $this->dismissUrlParam() => $id,
             '_wpnonce'               => $this->nonces->create($this->nonceAction($id)),
+            'context'                => $context,
         ]));
     }
 
+    /**
+     * Build meta ID (context-aware).
+     *
+     * @param string $id      Base notice ID.
+     * @param string $context Context.
+     * @return string
+     */
+    private function buildMetaId(string $id, string $context): string
+    {
+        return $this->safePrefix . '_' . $id . '_' . $context;
+    }
+
+    /**
+     * Build storage key for persistent notices.
+     *
+     * @param string $id      Base notice ID.
+     * @param string $context Context.
+     * @return string
+     */
+    private function buildStorageKey(string $id, string $context): string
+    {
+        return $this->safePrefix . '_' . $id . '_' . $context;
+    }
+
+    /**
+     * Generate nonce action.
+     *
+     * @param string $id Notice ID (prefixed or base).
+     * @return string
+     */
     private function nonceAction(string $id): string
     {
         return $this->safePrefix . '_dismiss_' . $id;
     }
 
+    /**
+     * Get AJAX action tag.
+     *
+     * @return string
+     */
     private function dismissAjaxTag(): string
     {
         return $this->safePrefix . '_dismiss_notice';
     }
 
+    /**
+     * Get URL parameter name.
+     *
+     * @return string
+     */
     private function dismissUrlParam(): string
     {
         return $this->safePrefix . '_dismiss_notice';
     }
 
-    private function getFlashQueue(): array
-    {
-        if (null !== $this->flashQueue) {
-            return $this->flashQueue;
-        }
-
-        if (0 === $this->userId || !\function_exists('get_transient')) {
-            return [];
-        }
-
-        $data = \get_transient($this->transientKey());
-        return \is_array($data) ? $data : [];
-    }
-
+    /**
+     * Save flash queue to transient.
+     *
+     * @return void
+     */
     private function saveFlashQueue(): void
     {
         if (0 === $this->userId || !\function_exists('set_transient')) {
@@ -559,30 +694,54 @@ class NoticesManager implements Noticesable
         \set_transient($this->transientKey(), $this->flashQueue, $this->defaultTtl);
     }
 
+    /**
+     * Get dismissed meta (context-aware).
+     *
+     * @return array
+     */
     private function getDismissedMeta(): array
     {
         if (0 === $this->userId) {
             return [];
         }
 
-        if ($this->isNetworkContext) {
-            return $this->getNetworkStorage();
-        }
-        return $this->getUserStorage();
+        return $this->isNetworkContext() ? $this->getNetworkStorage() : $this->getUserStorage();
     }
 
+    /**
+     * Set dismissed meta (context-aware).
+     *
+     * @param array $data Data to save.
+     * @return bool
+     */
     private function setDismissedMeta(array $data): bool
     {
         if (0 === $this->userId) {
             return false;
         }
 
-        if ($this->isNetworkContext) {
+        if ($this->isNetworkContext()) {
             return \update_site_option($this->metaKey(), $data);
         }
         return \update_user_meta($this->userId, $this->metaKey(), $data);
     }
 
+    /**
+     * Lazy multisite/network detection (runtime, not constructor).
+     *
+     * @return bool
+     */
+    private function isNetworkContext(): bool
+    {
+        return \function_exists('is_multisite') && \is_multisite()
+            && \function_exists('is_network_admin') && \is_network_admin();
+    }
+
+    /**
+     * Get user storage.
+     *
+     * @return array
+     */
     private function getUserStorage(): array
     {
         if (!\function_exists('get_user_meta')) {
@@ -592,6 +751,11 @@ class NoticesManager implements Noticesable
         return \is_array($data) ? $data : [];
     }
 
+    /**
+     * Get network storage.
+     *
+     * @return array
+     */
     private function getNetworkStorage(): array
     {
         if (!\function_exists('get_site_option')) {
@@ -601,11 +765,21 @@ class NoticesManager implements Noticesable
         return \is_array($data) ? $data : [];
     }
 
+    /**
+     * Get transient key.
+     *
+     * @return string
+     */
     private function transientKey(): string
     {
         return $this->safePrefix . '_flash_' . $this->userId;
     }
 
+    /**
+     * Get meta key.
+     *
+     * @return string
+     */
     private function metaKey(): string
     {
         return $this->safePrefix . '_dismissed';
